@@ -99,9 +99,10 @@ attempts on the targeted path, with the same fallback to the whole command.
 When the runner retries on its own (Playwright `retries`), its attempts are
 the budget and nothing is rerun again.
 
-**Missing results.** A quarantined id missing from a run that included its
-file (and, for Playwright, its project) is red. A run that did not include the
-file, such as a shard or a diff selection, is not.
+**Incomplete results.** An initial run or whole-command rerun is red if it
+reports a live quarantined test only as skipped. A quarantined id missing
+from a run that included its file (and, for Playwright, its project) is also
+red. Shards and diff selections can still omit files outside their selection.
 
 **Read from the base branch.** `run --base <ref>` reads the registry from
 that commit instead of the working tree. Pull-request CI passes its target

@@ -219,6 +219,7 @@ function fakeRun(reports: (n: number, argv: string[]) => string | null, exits: (
 const suite = (cases: string, file = 'a.test.ts') => `<testsuites name="bun test"><testsuite name="${file}" file="${file}">${cases}</testsuite></testsuites>`;
 const pass = (name: string) => `<testcase name="${name}" classname="" file="a.test.ts"/>`;
 const fail = (name: string) => `<testcase name="${name}" classname="" file="a.test.ts"><failure message="boom"/></testcase>`;
+const skip = (name: string, file = 'a.test.ts') => `<testcase name="${name}" classname="" file="${file}"><skipped/></testcase>`;
 const Q = new Set(['a.test.ts::::q']);
 const run = (f: ReturnType<typeof fakeRun>, extra: Partial<Parameters<typeof runFlaky>[0]> = {}) =>
   runFlaky({ command: ['bun', 'test'], junit: 'r.xml', maxReruns: 3, cwd: tmp(), spawn: f.spawn, env: {}, now: () => NOW, quarantined: Q, ...extra });
@@ -330,6 +331,89 @@ describe('the quarantine attempt budget under the full green verdict', () => {
     const r = await run(f, { quarantined: liveQuarantine(reg, at(8)).ids });
     expect(f.calls).toHaveLength(2);
     expect([r.exitCode, r.outcomes[0]!.status, r.quarantined]).toEqual([1, 'rerun-fail', 0]);
+  });
+});
+
+describe('skipped quarantined tests', () => {
+  test('a live quarantined skip on the first attempt stays red and breaks the clean streak', async () => {
+    const id = 'a.test.ts::::q';
+    const reg = emptyRegistry();
+    add(reg, id, { suiteIds: [id] }, at(-1));
+    const f = fakeRun(() => suite(pass('a') + skip('q')), () => 0);
+    const r = await run(f, { quarantined: liveQuarantine(reg, NOW).ids });
+    expect(f.calls).toHaveLength(1);
+    expect(r).toMatchObject({
+      exitCode: 1, commandExit: 0, reruns: 0, quarantined: 1,
+      outcomes: [{ test: { id }, status: 'quarantined-fail', attempts: ['skip'] }],
+      ledger: [{ id, kind: 'quarantined-fail', attempts: ['skip'] }],
+    });
+    expect(r.outcomes[0]?.reason).toMatch(/skipp/i);
+    const clean = Array.from({ length: 9 }, (_, i) => ({
+      ts: new Date(NOW.getTime() - (9 - i) * 1_000).toISOString(),
+      id, kind: 'quarantined-pass', attempts: ['pass'],
+    }));
+    expect(reportLines(reg, NOW, clean)[0]).toContain('clean_streak=9');
+    expect(reportLines(reg, NOW, [...clean, ...r.ledger])[0]).toContain('clean_streak=0');
+  });
+
+  test('a previously passing quarantined test must run again on a whole-command rerun', async () => {
+    const f = fakeRun(n => suite(n === 1 ? fail('a') + pass('q') : pass('a') + skip('q')), n => n === 1 ? 1 : 0);
+    const r = await run(f);
+    expect(f.calls).toHaveLength(2);
+    expect([r.exitCode, r.reruns]).toEqual([1, 1]);
+    expect(r.outcomes).toHaveLength(2);
+    expect(r.outcomes).toContainEqual(expect.objectContaining({
+      test: expect.objectContaining({ id: 'a.test.ts::::a' }), status: 'rerun-fail', attempts: ['fail', 'pass'],
+    }));
+    expect(r.outcomes).toContainEqual(expect.objectContaining({
+      test: expect.objectContaining({ id: 'a.test.ts::::q' }), status: 'quarantined-fail', attempts: ['pass', 'skip'],
+    }));
+    expect(r.ledger).toContainEqual(expect.objectContaining({
+      id: 'a.test.ts::::q', kind: 'quarantined-fail', attempts: ['pass', 'skip'], rerun_scope: 'command',
+    }));
+  });
+
+  test('a previously failing quarantine that skips prevents another whole-command rerun', async () => {
+    const f = fakeRun(n => suite(n === 1 ? fail('q') + fail('second')
+      : n === 2 ? skip('q') + fail('second') : pass('q') + pass('second')), n => n < 3 ? 1 : 0);
+    const r = await run(f, { quarantined: new Set(['a.test.ts::::q', 'a.test.ts::::second']) });
+    expect(f.calls).toHaveLength(2);
+    expect([r.exitCode, r.reruns]).toEqual([1, 1]);
+    expect(r.ledger.map(l => [l.id, l.kind, l.attempts])).toEqual([
+      ['a.test.ts::::q', 'quarantined-fail', ['fail', 'skip']],
+      ['a.test.ts::::second', 'quarantined-fail', ['fail', 'fail']],
+    ]);
+  });
+
+  test('a newly reported quarantine skip during a whole-command rerun is recorded once', async () => {
+    const id = 'b.test.ts::::new';
+    const newPass = '<testcase name="new" classname="" file="b.test.ts"/>';
+    const f = fakeRun(n => suite(n === 1 ? fail('q') : n === 2 ? fail('q') + newPass
+      : pass('q') + skip('new', 'b.test.ts')), n => n < 3 ? 1 : 0);
+    const r = await run(f, { quarantined: new Set([...Q, id]) });
+    expect(f.calls).toHaveLength(3);
+    expect([r.exitCode, r.quarantined]).toEqual([1, 2]);
+    expect(r.ledger.filter(l => l.id === id)).toMatchObject([{ kind: 'quarantined-fail', attempts: ['pass', 'skip'] }]);
+  });
+
+  test('a repeated quarantined id with a passing execution is not skip-only', async () => {
+    for (const cases of [pass('q') + skip('q'), skip('q') + pass('q')]) {
+      const f = fakeRun(() => suite(cases), () => 0);
+      const r = await run(f);
+      expect(f.calls).toHaveLength(1);
+      expect(r).toMatchObject({ exitCode: 0, reruns: 0, quarantined: 1 });
+      expect(r.ledger[0]).toMatchObject({ id: 'a.test.ts::::q', kind: 'quarantined-pass' });
+    }
+  });
+
+  test('ordinary and expired quarantine skips keep the runner verdict', async () => {
+    const id = 'a.test.ts::::q';
+    const reg = emptyRegistry();
+    add(reg, id, { suiteIds: [id] }, at(-8));
+    const f = fakeRun(() => suite(pass('a') + skip('q') + skip('ordinary')), () => 0);
+    const r = await run(f, { quarantined: liveQuarantine(reg, NOW).ids });
+    expect(f.calls).toHaveLength(1);
+    expect(r).toMatchObject({ exitCode: 0, outcomes: [], reruns: 0, quarantined: 0, ledger: [] });
   });
 });
 
